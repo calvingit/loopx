@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+set -u
+
+# loopx - Codex CLI 长任务自动恢复包装器
+#
+# 设计思路：
+# 1. 默认把运行 loopx 时的当前目录作为 Codex workspace；可用 --dir 覆盖。
+# 2. 默认执行普通任务；只有显式传入 --goal 时才发送 `/goal <prompt>`。
+# 3. 任务始终运行在同一个 Codex TUI/tmux 会话中，尽量保留当前 thread 和已完成工作。
+# 4. capacity、429、5xx、网络错误等临时故障自动退避重试；认证、quota、policy、
+#    context 等通常无法靠重试解决的问题停止自动恢复。
+# 5. Goal 模式用 `/goal resume` 恢复；普通任务发送 continuation prompt，不重放原始提示词。
+# 6. 普通临时错误第一次默认等待 10 秒，随后指数退避；Retry-After 优先于本地退避。
+# 7. `--` 之后的参数原样透传给 codex。workspace 统一由 --dir 管理，因此禁止透传 -C/--cd。
+
+# 同一错误类型超过该秒数未再次出现后，将该类型的重试计数重置为 1。
+RESET_AFTER="${LOOPX_RESET_AFTER:-600}"
+# watchdog 读取 tmux 输出日志的轮询间隔，单位：秒。
+POLL_INTERVAL="${LOOPX_POLL_INTERVAL:-2}"
+# 启动/复用 Codex TUI 后，首次发送任务提示词前的等待时间，单位：秒。
+STARTUP_DELAY="${LOOPX_STARTUP_DELAY:-2}"
+# 普通任务发生可重试错误后的继续提示词；--goal 模式不使用它。
+CONTINUE_PROMPT="${LOOPX_CONTINUE_PROMPT:-Continue the previous task from where it stopped. Do not restart or repeat completed work.}"
+
+# capacity：第一次重试前等待秒数。
+CAPACITY_BASE_DELAY="${LOOPX_CAPACITY_BASE_DELAY:-10}"
+# capacity：指数退避最大等待秒数。
+CAPACITY_MAX_DELAY="${LOOPX_CAPACITY_MAX_DELAY:-300}"
+# capacity：最大自动重试次数；0 表示不限次数。
+CAPACITY_MAX_RETRIES="${LOOPX_CAPACITY_MAX_RETRIES:-0}"
+
+# rate limit：第一次重试前等待秒数。
+RATE_BASE_DELAY="${LOOPX_RATE_BASE_DELAY:-10}"
+# rate limit：本地指数退避最大等待秒数；Retry-After 可以超过此值。
+RATE_MAX_DELAY="${LOOPX_RATE_MAX_DELAY:-900}"
+# rate limit：最大自动重试次数；0 表示不限次数。
+RATE_MAX_RETRIES="${LOOPX_RATE_MAX_RETRIES:-30}"
+
+# 5xx/server：第一次重试前等待秒数。
+SERVER_BASE_DELAY="${LOOPX_SERVER_BASE_DELAY:-10}"
+# 5xx/server：指数退避最大等待秒数。
+SERVER_MAX_DELAY="${LOOPX_SERVER_MAX_DELAY:-180}"
+# 5xx/server：最大自动重试次数；0 表示不限次数。
+SERVER_MAX_RETRIES="${LOOPX_SERVER_MAX_RETRIES:-20}"
+
+# network：第一次重试前等待秒数。
+NETWORK_BASE_DELAY="${LOOPX_NETWORK_BASE_DELAY:-10}"
+# network：指数退避最大等待秒数。
+NETWORK_MAX_DELAY="${LOOPX_NETWORK_MAX_DELAY:-120}"
+# network：最大自动重试次数；0 表示不限次数。
+NETWORK_MAX_RETRIES="${LOOPX_NETWORK_MAX_RETRIES:-0}"
+
+# usage limit：每次自动恢复前等待秒数，默认 30 分钟。
+USAGE_DELAY="${LOOPX_USAGE_DELAY:-1800}"
+# usage limit：最大自动重试次数；0 表示不限次数，默认约覆盖 24 小时。
+USAGE_MAX_RETRIES="${LOOPX_USAGE_MAX_RETRIES:-48}"
+
+usage() {
+  cat <<'USAGE'
+用法：
+  loopx [start] [loopx 参数] [--prompt TEXT | PROMPT] [-- codex 参数...]
+  loopx attach   [--dir DIR] [--session NAME]
+  loopx status   [--dir DIR] [--session NAME]
+  loopx stop     [--dir DIR] [--session NAME]
+  loopx classify TEXT
+
+Workspace：
+  默认使用执行 loopx 时的当前目录：
+    cd ~/projects/my-app
+    loopx "修复当前项目中失败的测试"
+
+  也可以显式指定：
+    loopx --dir ~/projects/my-app "修复失败的测试"
+
+普通任务（默认）：
+  loopx "修复当前分支的测试失败，并验证结果"
+  loopx --prompt "Review current changes and fix issues"
+  loopx --prompt "$(cat task.md)"
+  loopx --dir ~/projects/frontend "检查当前改动并修复问题"
+
+  遇到可重试错误后，loopx 在同一个 TUI thread 中发送继续提示词，不重放原始提示词。
+
+Goal 模式：
+  loopx --goal "实现 SPEC.md，直到所有 success criteria 通过"
+  loopx --goal --prompt "$(cat GOAL.md)"
+
+  遇到可重试错误后通过 `/goal resume` 恢复。
+
+Codex 参数透传：
+  `--` 之前是 loopx 参数和任务提示词，之后全部原样传给 codex：
+    loopx "修复测试" -- --yolo
+    loopx --goal "实现 SPEC.md" -- --yolo
+    loopx "检查并修复当前代码" -- --search -m MODEL
+    loopx --dir ~/projects/app "完成任务" -- -c 'model_reasoning_effort="high"'
+
+  workspace 统一由 loopx --dir 管理，因此禁止透传 `-C` / `--cd`。
+  已运行的 Codex 会话无法动态修改启动参数；需要先 loopx stop 再重新启动。
+
+loopx 参数：
+  --dir DIR       指定 Codex workspace；默认是执行 loopx 时的当前目录。
+  --session NAME  指定 tmux 会话名；默认根据最终 workspace 生成 loopx-<project>。
+  --prompt TEXT   显式传入提示词，适合多行文本、文件内容或脚本调用。
+  --goal          启用 Codex /goal 模式。
+  --log FILE      自定义 tmux 输出日志路径。
+  -h, --help      显示帮助。
+
+会话操作：
+  loopx attach
+  loopx status
+  loopx stop
+  loopx classify "错误文本"
+
+重试策略：
+  capacity      10s 起指数退避，最大 300s，默认不限次数
+  rate_limit    10s 起指数退避；优先遵守 Retry-After
+  server        500/502/503/504 等，10s 起指数退避
+  network       网络/timeout/stream 中断，10s 起指数退避，默认不限次数
+  usage_limit   默认等待 1800s 后重试
+
+  auth          不自动重试
+  quota         不自动重试
+  policy        不自动重试
+  context       不自动重试
+  goal_state    Goal 模式下停止自动恢复
+
+环境变量：
+  LOOPX_RESET_AFTER=600
+      同一错误类型超过多少秒未再次出现后，重置该类型的重试计数。
+  LOOPX_POLL_INTERVAL=2
+      watchdog 读取 Codex/tmux 输出日志的轮询间隔，单位：秒。
+  LOOPX_STARTUP_DELAY=2
+      启动或复用 Codex TUI 后，发送任务提示词前等待的秒数。
+  LOOPX_CONTINUE_PROMPT='Continue the previous task from where it stopped. Do not restart or repeat completed work.'
+      普通任务发生可重试错误后的继续提示词；--goal 模式使用 /goal resume。
+
+  LOOPX_CAPACITY_BASE_DELAY=10
+      capacity 第一次重试前等待秒数。
+  LOOPX_CAPACITY_MAX_DELAY=300
+      capacity 指数退避最大等待秒数。
+  LOOPX_CAPACITY_MAX_RETRIES=0
+      capacity 最大重试次数；0 表示不限次数。
+
+  LOOPX_RATE_BASE_DELAY=10
+      rate limit 第一次重试前等待秒数。
+  LOOPX_RATE_MAX_DELAY=900
+      rate limit 本地指数退避最大秒数；Retry-After 可以超过此值。
+  LOOPX_RATE_MAX_RETRIES=30
+      rate limit 最大重试次数；0 表示不限次数。
+
+  LOOPX_SERVER_BASE_DELAY=10
+      5xx/server 第一次重试前等待秒数。
+  LOOPX_SERVER_MAX_DELAY=180
+      5xx/server 指数退避最大等待秒数。
+  LOOPX_SERVER_MAX_RETRIES=20
+      5xx/server 最大重试次数；0 表示不限次数。
+
+  LOOPX_NETWORK_BASE_DELAY=10
+      network 第一次重试前等待秒数。
+  LOOPX_NETWORK_MAX_DELAY=120
+      network 指数退避最大等待秒数。
+  LOOPX_NETWORK_MAX_RETRIES=0
+      network 最大重试次数；0 表示不限次数。
+
+  LOOPX_USAGE_DELAY=1800
+      usage limit 每次自动恢复前等待秒数，默认 30 分钟。
+  LOOPX_USAGE_MAX_RETRIES=48
+      usage limit 最大重试次数；0 表示不限次数，默认约覆盖 24 小时。
+USAGE
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || { echo "缺少依赖：$1" >&2; exit 127; }
+}
+
+sanitize_session() { printf '%s' "$1" | tr -cs '[:alnum:]_-' '-'; }
+
+default_session_for_dir() {
+  printf 'loopx-%s' "$(sanitize_session "$(basename "$1")")"
+}
+
+resolve_dir() {
+  [ -d "$1" ] || { echo "workspace 不存在：$1" >&2; return 1; }
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+
+shell_join() {
+  local out="" arg q
+  for arg in "$@"; do
+    printf -v q '%q' "$arg"
+    [ -z "$out" ] || out+=" "
+    out+="$q"
+  done
+  printf '%s\n' "$out"
+}
+
+validate_codex_args() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -C|--cd|--cd=*|-C?*)
+        echo "不允许透传 Codex workspace 参数 '$arg'；请使用 loopx --dir DIR。" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+send_literal() {
+  local pane="$1" text="$2" buffer="loopx-${RANDOM}-${RANDOM}"
+  tmux set-buffer -b "$buffer" -- "$text"
+  tmux paste-buffer -b "$buffer" -t "$pane"
+  tmux delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+  tmux send-keys -t "$pane" Enter
+}
+
+strip_ansi() { sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g'; }
+
+classify_error() {
+  local text="$1"
+  if printf '%s\n' "$text" | grep -Eiq '(^|[^0-9])401([^0-9]|$)|unauthori[sz]ed|authentication (failed|error|required)|invalid (api[ _-]?key|authentication token)|incorrect api key'; then echo auth; return; fi
+  if printf '%s\n' "$text" | grep -Eiq 'insufficient_quota|exceeded your current quota|billing (hard )?limit|quota (exceeded|has been exceeded)|check your plan and billing'; then echo quota; return; fi
+  if printf '%s\n' "$text" | grep -Eiq 'usage policy|safety policy|content policy|prompt (was )?flagged|violat(e|es|ing|ion).*policy'; then echo policy; return; fi
+  if printf '%s\n' "$text" | grep -Eiq 'context_length_exceeded|maximum context length|context window.*(exceed|full)|too many tokens.*context|context.*too long'; then echo context; return; fi
+  if printf '%s\n' "$text" | grep -Eiq 'goal.*(blocked|cannot be resumed|can.t be resumed|resume failed)|no active goal|goal state.*(invalid|error)'; then echo goal_state; return; fi
+  if printf '%s\n' "$text" | grep -Eiq 'selected model is at capacity|model is at capacity|model.*capacity|capacity.*model'; then echo capacity; return; fi
+  if printf '%s\n' "$text" | grep -Eiq 'you.ve hit your usage limit|usage limit (reached|exceeded)|you have .* usage left|limit resets|usage.*resets'; then echo usage_limit; return; fi
+  if printf '%s\n' "$text" | grep -Eiq '(^|[^0-9])429([^0-9]|$)|rate[ -]?limit(ed|ing)?|too many requests|retry-after'; then echo rate_limit; return; fi
+  if printf '%s\n' "$text" | grep -Eiq '(^|[^0-9])(500|502|503|504)([^0-9]|$)|internal server error|bad gateway|service unavailable|gateway timeout|server overloaded'; then echo server; return; fi
+  if printf '%s\n' "$text" | grep -Eiq 'connection reset|connection refused|connection closed|failed to connect|network (error|failure)|timed? out|timeout|stream (disconnected|closed|error)|broken pipe|unexpected eof|dns (error|failure)|temporary failure in name resolution'; then echo network; return; fi
+  echo unknown
+}
+
+parse_retry_after() {
+  local text="$1" value unit
+  value="$(printf '%s\n' "$text" | sed -nE 's/.*[Rr]etry-[Aa]fter:[[:space:]]*([0-9]+).*/\1/p' | head -n 1)"
+  [ -z "$value" ] || { echo "$value"; return; }
+  value="$(printf '%s\n' "$text" | sed -nE 's/.*([Tt]ry again|[Rr]etry)[[:space:]]+in[[:space:]]+([0-9]+)[[:space:]]*(second|seconds|sec|secs|minute|minutes|min|mins|hour|hours|hr|hrs).*/\2/p' | head -n 1)"
+  unit="$(printf '%s\n' "$text" | sed -nE 's/.*([Tt]ry again|[Rr]etry)[[:space:]]+in[[:space:]]+[0-9]+[[:space:]]*(second|seconds|sec|secs|minute|minutes|min|mins|hour|hours|hr|hrs).*/\2/p' | head -n 1 | tr '[:upper:]' '[:lower:]')"
+  if [ -n "$value" ] && [ -n "$unit" ]; then
+    case "$unit" in
+      second|seconds|sec|secs) echo "$value" ;;
+      minute|minutes|min|mins) echo "$((value * 60))" ;;
+      hour|hours|hr|hrs) echo "$((value * 3600))" ;;
+    esac
+    return
+  fi
+  echo 0
+}
+
+calc_backoff() {
+  local attempt="$1" base="$2" max="$3" delay="$2" i=1
+  while [ "$i" -lt "$attempt" ] && [ "$delay" -lt "$max" ]; do
+    delay=$((delay * 2)); [ "$delay" -le "$max" ] || delay="$max"; i=$((i + 1))
+  done
+  echo "$delay"
+}
+
+retry_policy() {
+  local class="$1" attempt="$2" text="$3" hint=0 delay max_retries
+  case "$class" in
+    capacity) delay="$(calc_backoff "$attempt" "$CAPACITY_BASE_DELAY" "$CAPACITY_MAX_DELAY")"; max_retries="$CAPACITY_MAX_RETRIES" ;;
+    rate_limit) delay="$(calc_backoff "$attempt" "$RATE_BASE_DELAY" "$RATE_MAX_DELAY")"; max_retries="$RATE_MAX_RETRIES"; hint="$(parse_retry_after "$text")"; [ "$hint" -le "$delay" ] || delay="$hint" ;;
+    server) delay="$(calc_backoff "$attempt" "$SERVER_BASE_DELAY" "$SERVER_MAX_DELAY")"; max_retries="$SERVER_MAX_RETRIES" ;;
+    network) delay="$(calc_backoff "$attempt" "$NETWORK_BASE_DELAY" "$NETWORK_MAX_DELAY")"; max_retries="$NETWORK_MAX_RETRIES" ;;
+    usage_limit) delay="$USAGE_DELAY"; max_retries="$USAGE_MAX_RETRIES"; hint="$(parse_retry_after "$text")"; [ "$hint" -le "$delay" ] || delay="$hint" ;;
+    *) return 1 ;;
+  esac
+  printf '%s %s\n' "$delay" "$max_retries"
+}
+
+state_get() { [ -f "$1" ] || return 0; sed -n "s/^${2}=//p" "$1" | tail -n 1; }
+state_set() {
+  local file="$1" key="$2" value="$3" tmp="${1}.tmp.$$"
+  touch "$file"; grep -v "^${key}=" "$file" > "$tmp" || true; printf '%s=%s\n' "$key" "$value" >> "$tmp"; mv "$tmp" "$file"
+}
+
+runtime_write() {
+  local file="$1" state="$2" class="${3:-}" attempt="${4:-0}" next_retry_at="${5:-0}"
+  cat > "${file}.tmp.$$" <<EOF
+state=$state
+class=$class
+attempt=$attempt
+next_retry_at=$next_retry_at
+updated_at=$(date +%s)
+EOF
+  mv "${file}.tmp.$$" "$file"
+}
+
+next_attempt() {
+  local file="$1" class="$2" now="$3" count last
+  count="$(state_get "$file" "${class}_count")"; last="$(state_get "$file" "${class}_last_at")"
+  [ -n "$count" ] || count=0; [ -n "$last" ] || last=0
+  if [ "$last" -eq 0 ] || [ $((now - last)) -ge "$RESET_AFTER" ]; then count=1; else count=$((count + 1)); fi
+  state_set "$file" "${class}_count" "$count"; state_set "$file" "${class}_last_at" "$now"; echo "$count"
+}
+
+recover_turn() {
+  if [ "$2" -eq 1 ]; then send_literal "$1" "/goal resume"; echo "[watchdog] 已发送：/goal resume"; else send_literal "$1" "$CONTINUE_PROMPT"; echo "[watchdog] 已发送普通任务继续指令"; fi
+}
+
+watch_loop() {
+  local session="$1" log="$2" goal_mode="$3" retry_state="$4" runtime_file="$5" pane="${1}:0.0"
+  local seen_lines total new_text clean_text class now attempt policy delay max_retries next_retry_at
+  touch "$log" "$retry_state"; seen_lines="$(wc -l < "$log" | tr -d ' ')"; runtime_write "$runtime_file" watching
+  while tmux has-session -t "$session" 2>/dev/null; do
+    total="$(wc -l < "$log" | tr -d ' ')"
+    if [ "$total" -gt "$seen_lines" ]; then
+      new_text="$(sed -n "$((seen_lines + 1)),${total}p" "$log")"; seen_lines="$total"
+      clean_text="$(printf '%s\n' "$new_text" | strip_ansi)"; class="$(classify_error "$clean_text")"
+      case "$class" in
+        unknown) ;;
+        auth|quota|policy|context) echo "[watchdog] 不可重试错误：class=$class" >&2; runtime_write "$runtime_file" manual_intervention "$class"; return 3 ;;
+        goal_state) if [ "$goal_mode" -eq 1 ]; then echo "[watchdog] Goal 生命周期错误" >&2; runtime_write "$runtime_file" manual_intervention "$class"; return 3; fi ;;
+        capacity|rate_limit|server|network|usage_limit)
+          now="$(date +%s)"; attempt="$(next_attempt "$retry_state" "$class" "$now")"; policy="$(retry_policy "$class" "$attempt" "$clean_text")"
+          delay="${policy%% *}"; max_retries="${policy##* }"
+          if [ "$max_retries" -gt 0 ] && [ "$attempt" -gt "$max_retries" ]; then runtime_write "$runtime_file" retry_exhausted "$class" "$attempt"; return 2; fi
+          next_retry_at=$((now + delay)); runtime_write "$runtime_file" waiting_retry "$class" "$attempt" "$next_retry_at"
+          echo "[watchdog] 可重试错误：class=$class attempt=$attempt ${delay}s 后重试"; sleep "$delay"
+          tmux has-session -t "$session" 2>/dev/null || { runtime_write "$runtime_file" session_stopped "$class" "$attempt"; return 0; }
+          recover_turn "$pane" "$goal_mode"; runtime_write "$runtime_file" watching "$class" "$attempt"
+          ;;
+      esac
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+  runtime_write "$runtime_file" session_stopped
+}
+
+case "${1:-}" in
+  start|attach|status|stop|classify|_watch) COMMAND="$1"; shift ;;
+  -h|--help) usage; exit 0 ;;
+  *) COMMAND=start ;;
+esac
+
+INVOCATION_DIR="$(pwd -P)"; DIR_INPUT="$INVOCATION_DIR"; DIR=""; SESSION=""; SESSION_EXPLICIT=0
+PROMPT=""; PROMPT_FROM_OPTION=0; PROMPT_PARTS=(); GOAL_MODE=0; LOG=""; CODEX_ARGS=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dir) [ "$#" -ge 2 ] || { echo "--dir 需要一个值" >&2; exit 2; }; DIR_INPUT="$2"; shift 2 ;;
+    --session) [ "$#" -ge 2 ] || { echo "--session 需要一个值" >&2; exit 2; }; SESSION="$2"; SESSION_EXPLICIT=1; shift 2 ;;
+    --prompt) [ "$#" -ge 2 ] || { echo "--prompt 需要一个值" >&2; exit 2; }; PROMPT="$2"; PROMPT_FROM_OPTION=1; shift 2 ;;
+    --goal) GOAL_MODE=1; shift ;;
+    --log) [ "$#" -ge 2 ] || { echo "--log 需要一个值" >&2; exit 2; }; LOG="$2"; shift 2 ;;
+    --) shift; while [ "$#" -gt 0 ]; do CODEX_ARGS+=("$1"); shift; done ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "未知 loopx 参数：$1；如需传给 codex，请放在 -- 之后。" >&2; exit 2 ;;
+    *) PROMPT_PARTS+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#PROMPT_PARTS[@]}" -gt 0 ]; then
+  [ "$PROMPT_FROM_OPTION" -eq 0 ] || { echo "--prompt TEXT 与位置参数 PROMPT 只能使用一种" >&2; exit 2; }
+  PROMPT="${PROMPT_PARTS[*]}"
+fi
+
+if [ "$COMMAND" = classify ]; then [ -n "$PROMPT" ] || { echo "classify 需要传入错误文本" >&2; exit 2; }; classify_error "$PROMPT"; exit 0; fi
+
+DIR="$(resolve_dir "$DIR_INPUT")" || exit 2
+[ "$SESSION_EXPLICIT" -eq 1 ] || SESSION="$(default_session_for_dir "$DIR")"
+SESSION="$(sanitize_session "$SESSION")"; validate_codex_args "${CODEX_ARGS[@]}" || exit 2
+
+PANE="${SESSION}:0.0"; STATE_DIR="${TMPDIR:-/tmp}/loopx"; mkdir -p "$STATE_DIR"
+[ -n "$LOG" ] || LOG="${STATE_DIR}/${SESSION}.log"; mkdir -p "$(dirname "$LOG")"
+PID_FILE="${STATE_DIR}/${SESSION}.pid"; WATCH_LOG="${STATE_DIR}/${SESSION}.watchdog.log"; MODE_FILE="${STATE_DIR}/${SESSION}.mode"
+DIR_FILE="${STATE_DIR}/${SESSION}.dir"; ARGS_FILE="${STATE_DIR}/${SESSION}.codex-args"; RETRY_STATE="${STATE_DIR}/${SESSION}.retry-state"
+RUNTIME_FILE="${STATE_DIR}/${SESSION}.runtime"; SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"; CODEX_ARGS_STRING="$(shell_join "${CODEX_ARGS[@]}")"
+
+case "$COMMAND" in
+  start)
+    need tmux; need codex
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      PREVIOUS_DIR="$(cat "$DIR_FILE" 2>/dev/null || true)"; PREVIOUS_ARGS="$(cat "$ARGS_FILE" 2>/dev/null || true)"
+      [ -z "$PREVIOUS_DIR" ] || [ "$PREVIOUS_DIR" = "$DIR" ] || { echo "当前会话 '$SESSION' 已绑定 workspace：$PREVIOUS_DIR" >&2; exit 2; }
+      if [ "${#CODEX_ARGS[@]}" -gt 0 ] && [ "$PREVIOUS_ARGS" != "$CODEX_ARGS_STRING" ]; then echo "当前会话已经运行，无法动态修改 Codex 启动参数；请先 loopx stop。" >&2; exit 2; fi
+    else
+      CODEX_CMD="$(shell_join codex "${CODEX_ARGS[@]}")"; tmux new-session -d -s "$SESSION" -c "$DIR" "$CODEX_CMD"
+      printf '%s\n' "$DIR" > "$DIR_FILE"; printf '%s\n' "$CODEX_ARGS_STRING" > "$ARGS_FILE"
+    fi
+    : > "$LOG"; printf -v LOG_Q '%q' "$LOG"; tmux pipe-pane -t "$PANE" "cat >> $LOG_Q"
+    DESIRED_MODE=normal; [ "$GOAL_MODE" -eq 0 ] || DESIRED_MODE=goal; PREVIOUS_MODE="$(cat "$MODE_FILE" 2>/dev/null || true)"
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && [ -n "$PREVIOUS_MODE" ] && [ "$PREVIOUS_MODE" != "$DESIRED_MODE" ]; then kill "$(cat "$PID_FILE")" 2>/dev/null || true; rm -f "$PID_FILE"; fi
+    printf '%s\n' "$DESIRED_MODE" > "$MODE_FILE"
+    if ! { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }; then
+      WATCH_ARGS=("$SELF" _watch --dir "$DIR" --session "$SESSION" --log "$LOG"); [ "$GOAL_MODE" -eq 0 ] || WATCH_ARGS+=(--goal)
+      nohup "${WATCH_ARGS[@]}" > "$WATCH_LOG" 2>&1 & echo $! > "$PID_FILE"
+    fi
+    if [ -n "$PROMPT" ]; then sleep "$STARTUP_DELAY"; if [ "$GOAL_MODE" -eq 1 ]; then send_literal "$PANE" "/goal $PROMPT"; else send_literal "$PANE" "$PROMPT"; fi; fi
+    echo "会话：$SESSION"; echo "workspace：$DIR"; echo "模式：$DESIRED_MODE"; echo "Codex 参数：$(cat "$ARGS_FILE" 2>/dev/null || printf '<无>')"; echo "watchdog 日志：$WATCH_LOG"
+    exec tmux attach-session -t "$SESSION"
+    ;;
+  _watch) need tmux; watch_loop "$SESSION" "$LOG" "$GOAL_MODE" "$RETRY_STATE" "$RUNTIME_FILE" ;;
+  attach) need tmux; exec tmux attach-session -t "$SESSION" ;;
+  status)
+    need tmux
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "会话：运行中 ($SESSION)"; echo "workspace：$(cat "$DIR_FILE" 2>/dev/null || printf '%s' "$DIR")"; [ -f "$MODE_FILE" ] && echo "模式：$(cat "$MODE_FILE")"; echo "Codex 参数：$(cat "$ARGS_FILE" 2>/dev/null || printf '<未知>')"
+      if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then echo "watchdog：运行中 (pid $(cat "$PID_FILE"))"; else echo "watchdog：已停止"; fi
+      [ ! -f "$RUNTIME_FILE" ] || { echo "运行状态："; sed 's/^/  /' "$RUNTIME_FILE"; }
+      echo "watchdog 日志：$WATCH_LOG"
+    else echo "会话：已停止 ($SESSION)"; exit 1; fi
+    ;;
+  stop)
+    need tmux
+    if [ -f "$PID_FILE" ]; then kill "$(cat "$PID_FILE")" 2>/dev/null || true; rm -f "$PID_FILE"; fi
+    tmux kill-session -t "$SESSION" 2>/dev/null || true; rm -f "$MODE_FILE" "$DIR_FILE" "$ARGS_FILE" "$RETRY_STATE"; runtime_write "$RUNTIME_FILE" session_stopped; echo "已停止：$SESSION"
+    ;;
+esac
