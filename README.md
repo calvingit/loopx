@@ -1,190 +1,154 @@
 # loopx
 
-`loopx` 是一个面向 Codex CLI 的轻量长任务运行器。它把 Codex TUI 放进 `tmux` 会话中，监听常见临时错误，并在等待后自动继续当前任务。
+English | [简体中文](./README.zh-CN.md)
 
-主要目标：
+`loopx` is a lightweight long-running task runner for Codex CLI. It keeps Codex TUI inside a `tmux` session, watches for common transient failures, waits with backoff, and continues the current task instead of forcing you to restart it manually.
 
-- 默认支持普通 Codex 任务，不强制使用 `/goal`
-- 使用 `--goal` 时通过 `/goal resume` 恢复 Goal
-- capacity、429、5xx、网络错误自动退避重试
-- 默认 workspace 是运行 `loopx` 时的当前目录，也可用 `--dir` 指定
-- `--` 之后的参数原样透传给 `codex`
-- 保持在同一个 Codex TUI/thread 中继续，避免重新启动整个任务
+Key capabilities:
 
-## 依赖
+- Normal Codex tasks are the default; `/goal` is optional
+- `--goal` resumes interrupted goals with `/goal resume`
+- Automatic recovery for capacity, 429/rate limit, 5xx, and network failures
+- The current directory is the default workspace; `--dir` can override it
+- Arguments after `--` are passed through to `codex`
+- Recovery stays in the same Codex TUI/thread whenever possible
+
+## Requirements
 
 - Bash
-- [Codex CLI](https://developers.openai.com/codex/cli/)
+- Codex CLI
 - `tmux`
 
-macOS：
+On macOS:
 
 ```bash
 brew install tmux
 ```
 
-## 安装
+## Installation
+
+The recommended installer chooses a writable destination, validates the downloaded script with `bash -n`, installs it atomically, and checks whether `tmux` and `codex` are available. It does not install third-party dependencies automatically.
+
+Quick install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/calvingit/loopx/main/loopx -o /usr/local/bin/loopx
-chmod +x /usr/local/bin/loopx
+curl -fsSL https://raw.githubusercontent.com/calvingit/loopx/main/install.sh | bash
 ```
 
-如果 `/usr/local/bin` 不可写，也可以安装到 `~/.local/bin`。
+If you prefer to inspect the installer first:
 
-## 普通任务
+```bash
+curl -fsSL https://raw.githubusercontent.com/calvingit/loopx/main/install.sh -o /tmp/loopx-install.sh
+less /tmp/loopx-install.sh
+bash /tmp/loopx-install.sh
+```
 
-默认就是普通 Codex 任务：
+Custom install prefix:
+
+```bash
+PREFIX="$HOME/.local" bash /tmp/loopx-install.sh
+```
+
+Default destination policy:
+
+1. If `PREFIX` is set, install to `$PREFIX/bin/loopx`.
+2. Otherwise use `/usr/local/bin/loopx` when `/usr/local/bin` is writable.
+3. Otherwise fall back to `~/.local/bin/loopx`.
+
+The installer warns if the selected directory is not in `PATH`.
+
+## Normal tasks
+
+Normal Codex tasks are the default mode:
 
 ```bash
 cd ~/projects/my-app
-loopx "修复当前分支的测试失败，并验证结果"
+loopx "Fix the failing tests and verify the result"
 ```
 
-也可以显式指定 workspace：
+Specify a workspace explicitly:
 
 ```bash
-loopx --dir ~/projects/my-app "检查当前改动并修复问题"
+loopx --dir ~/projects/my-app "Review the current changes and fix issues"
 ```
 
-多行提示词或文件内容：
+Pass a multi-line prompt or a file:
 
 ```bash
 loopx --prompt "$(cat task.md)"
 ```
 
-普通任务遇到可重试错误后，`loopx` 不会重放原始提示词，而是在同一个 TUI thread 中发送继续提示词，尽量避免重复执行已经完成的工作。
+When a retryable failure occurs, `loopx` does not replay the original prompt. It sends a continuation prompt in the same TUI thread to reduce the chance of repeating already completed work.
 
-## Goal 模式
+## Goal mode
 
-只有显式传入 `--goal` 时才使用 Codex `/goal`：
-
-```bash
-loopx --goal "实现 SPEC.md，直到所有 success criteria 通过"
-```
-
-或：
+Use `--goal` only when you want Codex `/goal` mode:
 
 ```bash
+loopx --goal "Implement SPEC.md until all success criteria pass"
 loopx --goal --prompt "$(cat GOAL.md)"
 ```
 
-Goal 遇到可重试错误后，`loopx` 会等待并发送：
+After a retryable failure, Goal mode waits and then sends `/goal resume`.
 
-```text
-/goal resume
-```
+## Passing Codex arguments
 
-## 透传 Codex 参数
-
-使用标准 `--` 分隔符。`--` 之后的参数全部传给 `codex`：
+Use the standard `--` separator. Everything after it is passed to `codex`:
 
 ```bash
-loopx "修复测试" -- --yolo
-
-loopx --goal "实现 SPEC.md" -- --yolo
-
-loopx "检查并修复当前代码" -- \
-  --search \
-  -m MODEL
+loopx "Review and fix the current code" -- --search -m MODEL
+loopx --dir ~/projects/app "Finish the task" -- -c 'model_reasoning_effort="high"'
 ```
 
-workspace 统一由 `loopx --dir` 管理，因此不允许透传 Codex 的 `-C` / `--cd`：
+Workspace selection is owned by `loopx --dir`, so Codex `-C` / `--cd` arguments are intentionally rejected.
+
+Codex startup arguments cannot be changed for an already running session. Stop it first, then start a new session with different Codex arguments.
+
+## Session management
 
 ```bash
-loopx --dir ~/projects/app "修复测试" -- --yolo
-```
-
-如果 Codex/tmux 会话已经启动，新的 Codex 启动参数不会动态生效。要修改启动参数，先停止当前会话：
-
-```bash
-loopx stop
-loopx "继续任务" -- --yolo
-```
-
-## 会话管理
-
-```bash
-# 查看状态
 loopx status
-
-# 重新进入 TUI
 loopx attach
-
-# 停止 watchdog 和 tmux 会话
 loopx stop
 ```
 
-指定 workspace：
+You can combine these commands with `--dir` or `--session` to select a specific session.
 
-```bash
-loopx status --dir ~/projects/my-app
-loopx attach --dir ~/projects/my-app
-loopx stop --dir ~/projects/my-app
-```
+## Error classification and recovery
 
-指定 session：
-
-```bash
-loopx --session frontend "检查当前改动"
-loopx status --session frontend
-```
-
-## 错误分类与恢复
-
-| 分类 | 默认行为 |
+| Class | Default behavior |
 | --- | --- |
-| `capacity` | 自动重试，10s 起指数退避，最大 300s，默认不限次数 |
-| `rate_limit` | 自动重试，10s 起；优先遵守 `Retry-After` |
-| `server` | 500/502/503/504 等自动重试，10s 起 |
-| `network` | 网络/timeout/stream 中断自动重试，10s 起，默认不限次数 |
-| `usage_limit` | 默认等待 1800s 后重试 |
-| `auth` | 停止自动恢复 |
-| `quota` | 停止自动恢复 |
-| `policy` | 停止自动恢复 |
-| `context` | 停止自动恢复 |
-| `goal_state` | Goal 模式下停止自动恢复 |
+| `capacity` | Retry automatically, exponential backoff from 10s up to 300s, unlimited retries by default |
+| `rate_limit` | Retry from 10s; honor `Retry-After` when present |
+| `server` | Retry 500/502/503/504-style failures from 10s |
+| `network` | Retry network/timeout/stream failures from 10s, unlimited retries by default |
+| `usage_limit` | Wait 1800s before retrying by default |
+| `auth` | Stop automatic recovery |
+| `quota` | Stop automatic recovery |
+| `policy` | Stop automatic recovery |
+| `context` | Stop automatic recovery |
+| `goal_state` | Stop automatic recovery in Goal mode |
 
-可以独立测试分类器：
+Test the classifier directly:
 
 ```bash
 loopx classify "Selected model is at capacity. Please try a different model."
 ```
 
-## 环境变量
+## Environment variables
 
-```text
-LOOPX_RESET_AFTER=600
-LOOPX_POLL_INTERVAL=2
-LOOPX_STARTUP_DELAY=2
-LOOPX_CONTINUE_PROMPT=...
+`loopx` supports `LOOPX_RESET_AFTER`, `LOOPX_POLL_INTERVAL`, `LOOPX_STARTUP_DELAY`, `LOOPX_CONTINUE_PROMPT`, plus per-error retry settings for capacity, rate limit, server, network, and usage limit.
 
-LOOPX_CAPACITY_BASE_DELAY=10
-LOOPX_CAPACITY_MAX_DELAY=300
-LOOPX_CAPACITY_MAX_RETRIES=0
-
-LOOPX_RATE_BASE_DELAY=10
-LOOPX_RATE_MAX_DELAY=900
-LOOPX_RATE_MAX_RETRIES=30
-
-LOOPX_SERVER_BASE_DELAY=10
-LOOPX_SERVER_MAX_DELAY=180
-LOOPX_SERVER_MAX_RETRIES=20
-
-LOOPX_NETWORK_BASE_DELAY=10
-LOOPX_NETWORK_MAX_DELAY=120
-LOOPX_NETWORK_MAX_RETRIES=0
-
-LOOPX_USAGE_DELAY=1800
-LOOPX_USAGE_MAX_RETRIES=48
-```
-
-所有变量的详细含义可查看：
+See all defaults and descriptions with:
 
 ```bash
 loopx --help
 ```
 
-## 说明
+## Limitations
 
-`loopx` 当前通过读取 Codex TUI/tmux 输出文本来识别错误，因此错误分类依赖 Codex 的错误文案。它适合作为当前 Codex CLI 的实用恢复层，但不是 Codex 官方的 Goal lifecycle API。
+`loopx` currently detects errors by reading Codex TUI/tmux output, so classification depends on Codex error messages. It is a practical recovery layer around the current Codex CLI, not an official Codex Goal lifecycle API.
+
+## License
+
+MIT
