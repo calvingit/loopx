@@ -6,12 +6,14 @@ English | [简体中文](./README.zh-CN.md)
 
 Key capabilities:
 
+- Run `loopx` without a prompt to open an interactive Codex TUI
 - Normal Codex tasks are the default; `/goal` is optional
 - `--goal` resumes interrupted goals with `/goal resume`
 - Automatic recovery for capacity, 429/rate limit, 5xx, and network failures
 - The current directory is the default workspace; `--dir` can override it
 - Arguments after `--` are passed through to `codex`
 - Recovery stays in the same Codex TUI/thread whenever possible
+- User-initiated interruptions such as `Conversation interrupted` are ignored
 
 ## Requirements
 
@@ -56,6 +58,18 @@ Default destination policy:
 3. Otherwise fall back to `~/.local/bin/loopx`.
 
 The installer warns if the selected directory is not in `PATH`.
+
+## Interactive mode
+
+Run `loopx` without a prompt to use Codex interactively:
+
+```bash
+loopx
+loopx --dir ~/projects/my-app
+loopx -- --yolo
+```
+
+This opens the Codex TUI directly and lets you chat as usual. The watchdog remains active and continues the current turn after retryable infrastructure failures. User-initiated interruptions such as `Conversation interrupted`, cancellation, or pressing Esc/Ctrl-C are ignored and do not trigger recovery.
 
 ## Normal tasks
 
@@ -128,6 +142,7 @@ You can combine these commands with `--dir` or `--session` to select a specific 
 | `policy` | Stop automatic recovery |
 | `context` | Stop automatic recovery |
 | `goal_state` | Stop automatic recovery in Goal mode |
+| `user_interrupt` | Ignore; do not retry or increment retry counters |
 
 Test the classifier directly:
 

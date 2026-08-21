@@ -6,12 +6,14 @@
 
 主要能力：
 
+- 不提供提示词时，直接打开可交互的 Codex TUI
 - 默认支持普通 Codex 任务，不强制使用 `/goal`
 - 使用 `--goal` 时通过 `/goal resume` 恢复 Goal
 - capacity、429、5xx、网络错误自动退避重试
 - 默认 workspace 是运行 `loopx` 时的当前目录，也可用 `--dir` 指定
 - `--` 之后的参数原样透传给 `codex`
 - 保持在同一个 Codex TUI/thread 中继续，避免重新启动整个任务
+- 忽略 `Conversation interrupted` 等用户主动中断
 
 ## 依赖
 
@@ -50,6 +52,18 @@ PREFIX="$HOME/.local" bash /tmp/loopx-install.sh
 ```
 
 默认安装策略：设置 `PREFIX` 时安装到 `$PREFIX/bin/loopx`；否则优先使用可写的 `/usr/local/bin`，不可写时回退到 `~/.local/bin`。
+
+## 交互模式
+
+不提供提示词时，`loopx` 会直接打开 Codex TUI：
+
+```bash
+loopx
+loopx --dir ~/projects/my-app
+loopx -- --yolo
+```
+
+用户可以像直接执行 `codex` 一样正常对话。watchdog 会继续监听真正的临时故障，并在同一个 TUI thread 中恢复当前任务；`Conversation interrupted`、用户主动取消、Esc/Ctrl-C 等交互中断会被忽略，不触发自动恢复。
 
 ## 普通任务
 
@@ -120,6 +134,7 @@ loopx stop
 | `policy` | 停止自动恢复 |
 | `context` | 停止自动恢复 |
 | `goal_state` | Goal 模式下停止自动恢复 |
+| `user_interrupt` | 忽略，不重试，也不增加重试计数 |
 
 可以独立测试分类器：
 
